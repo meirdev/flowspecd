@@ -1,0 +1,45 @@
+[package]
+name = "rust-router"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal router with BGP FlowSpec and IPFIX support"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Packet processing
+pnet = "0.35"
+
+# BGP - we implement a minimal FlowSpec-only BGP speaker ourselves
+# (zettabgp doesn't have full FlowSpec support)
+
+# Configuration
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+
+# HTTP API
+axum = "0.7"
+tower = "0.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+anyhow = "1"
+thiserror = "1"
+bytes = "1"
+parking_lot = "0.12"
+dashmap = "6"
+ipnet = { version = "2", features = ["serde"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
