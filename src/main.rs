@@ -6,7 +6,10 @@ use backend::nftables::Nftables;
 use backend::{Action, Backend, Rule};
 use bgp::attributes::PathAttribute;
 use bgp::flowspec::TrafficAction;
-use bgp::session::{extract_flowspec, extract_flowspec_withdrawals, Message, Session};
+use bgp::fsm::{Fsm, FsmAction, FsmConfig, FsmEvent, FsmState};
+use bgp::session::extract_flowspec;
+use bgp::session::extract_flowspec_withdrawals;
+use bgp::Update;
 use clap::Parser;
 use deku::DekuContainerRead;
 
@@ -67,14 +70,6 @@ fn parse_bgp_id(s: &str) -> Result<u32, String> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let mut session = if let Some(peer_addr) = &args.connect {
-        println!("Connecting to {}...", peer_addr);
-        Session::connect(peer_addr, args.my_as, args.bgp_id, args.hold_time).await?
-    } else {
-        println!("Listening on {}...", args.listen);
-        Session::listen(&args.listen, args.my_as, args.bgp_id, args.hold_time).await?
-    };
-
     // Initialize nftables backend
     let mut nft = Nftables::new();
     if !args.dry_run {
@@ -89,83 +84,124 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics::start_server(port);
     }
 
-    println!("Performing BGP handshake...");
-    let peer_open = if args.connect.is_some() {
-        session.handshake().await?
+    // Create FSM configuration
+    let config = if let Some(ref peer_addr) = args.connect {
+        println!("Mode: Active (connecting to {})", peer_addr);
+        FsmConfig::new(args.my_as, args.bgp_id, args.hold_time).with_peer(peer_addr.clone())
     } else {
-        session.accept_handshake().await?
+        println!("Mode: Passive (listening on {})", args.listen);
+        FsmConfig::new(args.my_as, args.bgp_id, args.hold_time).with_listen(args.listen.clone())
     };
 
-    println!("Session established!");
-    println!("  Peer AS: {}", peer_open.my_as);
-    println!("  Peer BGP ID: {:08X}", peer_open.bgp_id);
-    println!("  Hold time: {}", peer_open.hold_time);
+    // Create FSM
+    let mut fsm = Fsm::new(config);
 
-    println!("\nWaiting for messages...");
+    // Send initial start event
+    let start_event = if args.connect.is_some() {
+        FsmEvent::ManualStart
+    } else {
+        FsmEvent::ManualStartWithPassiveTcp
+    };
+
+    // Process initial start event and any follow-up events
+    let mut action = fsm.handle_event(start_event);
     loop {
-        match session.read_message().await {
-            Ok(Message::Update(update)) => {
-                println!("Received UPDATE");
-                match update.parse_attributes() {
-                    Ok(attrs) => {
-                        // Handle announcements
-                        let flowspecs = extract_flowspec(&attrs);
-                        let action = extract_action(&attrs);
+        match fsm.execute_action(action).await? {
+            Some(follow_up_event) => {
+                action = fsm.handle_event(follow_up_event);
+            }
+            None => break,
+        }
+    }
 
-                        for fs in &flowspecs {
-                            println!("  FlowSpec ADD: {:?}", fs.components);
-                            println!("  Action: {:?}", action);
+    println!("FSM started in state: {}", fsm.state());
+    println!("Waiting for BGP session...\n");
 
-                            let rule = Rule::new(fs, action.clone());
-
-                            if args.dry_run {
-                                println!("  [dry-run] {}", nft.command_for_rule(&rule));
-                            } else {
-                                match nft.apply(&rule) {
-                                    Ok(()) => println!("  Applied to nftables"),
-                                    Err(e) => eprintln!("  Failed to apply: {}", e),
-                                }
-                            }
-                        }
-
-                        // Handle withdrawals
-                        let withdrawals = extract_flowspec_withdrawals(&attrs);
-
-                        for fs in &withdrawals {
-                            println!("  FlowSpec WITHDRAW: {:?}", fs.components);
-
-                            let rule = Rule::new(fs, Action::Drop);
-
-                            if args.dry_run {
-                                println!("  [dry-run] {}", nft.command_for_remove(&rule));
-                            } else {
-                                match nft.remove(&rule) {
-                                    Ok(()) => println!("  Removed from nftables"),
-                                    Err(e) => eprintln!("  Failed to remove: {}", e),
-                                }
-                            }
-                        }
+    // Main FSM event loop
+    loop {
+        match fsm.run_once().await {
+            Ok(FsmAction::ProcessUpdate(update)) => {
+                handle_update(&update, &mut nft, args.dry_run);
+            }
+            Ok(FsmAction::SessionEstablished) => {
+                if let Some(peer) = fsm.peer_open() {
+                    println!("Session established!");
+                    println!("  Peer AS: {}", peer.my_as);
+                    println!("  Peer BGP ID: {:08X}", peer.bgp_id);
+                    if let Some(hold_time) = fsm.negotiated_hold_time() {
+                        println!("  Negotiated hold time: {} seconds", hold_time.as_secs());
                     }
-                    Err(e) => println!("  parse error: {:?}", e),
+                    println!("\nWaiting for UPDATE messages...\n");
                 }
             }
-            Ok(Message::Keepalive) => {
-                println!("Received KEEPALIVE");
-                session.send_keepalive().await?;
-            }
-            Ok(Message::Notification(n)) => {
-                println!("Received NOTIFICATION: {:?}", n.error_code);
+            Ok(FsmAction::PeerNotification(notification)) => {
+                println!("Peer sent NOTIFICATION: {}", notification);
                 break;
             }
-            Ok(msg) => println!("Received: {:?}", msg),
+            Ok(_) => {
+                // Other actions handled internally
+            }
             Err(e) => {
-                eprintln!("Error: {}", e);
+                eprintln!("FSM error: {}", e);
                 break;
             }
+        }
+
+        // Check if we've transitioned back to Idle (session ended)
+        if fsm.state() == FsmState::Idle {
+            println!("Session ended, FSM returned to Idle state");
+            break;
         }
     }
 
     Ok(())
+}
+
+/// Handle received UPDATE message
+fn handle_update(update: &Update, nft: &mut Nftables, dry_run: bool) {
+    println!("Received UPDATE");
+    match update.parse_attributes() {
+        Ok(attrs) => {
+            // Handle announcements
+            let flowspecs = extract_flowspec(&attrs);
+            let action = extract_action(&attrs);
+
+            for fs in &flowspecs {
+                println!("  FlowSpec ADD: {:?}", fs.components);
+                println!("  Action: {:?}", action);
+
+                let rule = Rule::new(fs, action.clone());
+
+                if dry_run {
+                    println!("  [dry-run] {}", nft.command_for_rule(&rule));
+                } else {
+                    match nft.apply(&rule) {
+                        Ok(()) => println!("  Applied to nftables"),
+                        Err(e) => eprintln!("  Failed to apply: {}", e),
+                    }
+                }
+            }
+
+            // Handle withdrawals
+            let withdrawals = extract_flowspec_withdrawals(&attrs);
+
+            for fs in &withdrawals {
+                println!("  FlowSpec WITHDRAW: {:?}", fs.components);
+
+                let rule = Rule::new(fs, Action::Drop);
+
+                if dry_run {
+                    println!("  [dry-run] {}", nft.command_for_remove(&rule));
+                } else {
+                    match nft.remove(&rule) {
+                        Ok(()) => println!("  Removed from nftables"),
+                        Err(e) => eprintln!("  Failed to remove: {}", e),
+                    }
+                }
+            }
+        }
+        Err(e) => println!("  parse error: {:?}", e),
+    }
 }
 
 /// Extract action from extended communities in path attributes

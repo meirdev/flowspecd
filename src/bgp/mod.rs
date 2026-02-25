@@ -1,5 +1,6 @@
 pub mod attributes;
 pub mod flowspec;
+pub mod fsm;
 pub mod session;
 
 use deku::prelude::*;
@@ -83,6 +84,26 @@ pub struct Notification {
     pub error_subcode: u8,
     #[deku(read_all)]
     pub data: Vec<u8>,
+}
+
+impl Notification {
+    /// Create a new NOTIFICATION message
+    pub fn new(error_code: ErrorCode, error_subcode: u8) -> Self {
+        Self {
+            error_code,
+            error_subcode,
+            data: vec![],
+        }
+    }
+
+    /// Create a new NOTIFICATION message with data
+    pub fn with_data(error_code: ErrorCode, error_subcode: u8, data: Vec<u8>) -> Self {
+        Self {
+            error_code,
+            error_subcode,
+            data,
+        }
+    }
 }
 
 impl std::fmt::Display for Notification {

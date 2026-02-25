@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::attributes::PathAttribute;
-use super::{Header, MessageType, Notification, Open, Safi, Update, BGP_HEADER_LEN};
+use super::{ErrorCode, Header, MessageType, Notification, Open, Safi, Update, BGP_HEADER_LEN};
 
 #[allow(dead_code)]
 pub const BGP_PORT: u16 = 179;
@@ -86,6 +86,27 @@ impl Session {
     pub async fn send_keepalive(&mut self) -> Result<()> {
         let header = Header::new(MessageType::Keepalive, 0);
         self.stream.write_all(&header.to_bytes()?).await?;
+        Ok(())
+    }
+
+    /// Send NOTIFICATION message
+    pub async fn send_notification(
+        &mut self,
+        error_code: ErrorCode,
+        error_subcode: u8,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let notification = Notification::with_data(error_code, error_subcode, data);
+        let body = notification.to_bytes()?;
+        let header = Header::new(MessageType::Notification, body.len() as u16);
+
+        eprintln!(
+            "DEBUG: Sending NOTIFICATION: {:?} subcode {}",
+            error_code, error_subcode
+        );
+        self.stream.write_all(&header.to_bytes()?).await?;
+        self.stream.write_all(&body).await?;
+        self.stream.flush().await?;
         Ok(())
     }
 
