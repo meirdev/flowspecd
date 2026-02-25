@@ -1,387 +1,335 @@
-use crate::config::{FlowSpecAction, PortRange};
-use crate::flowspec::FlowSpecRule;
-use ipnet::Ipv4Net;
-use std::net::Ipv4Addr;
+use deku::prelude::*;
 
-/// FlowSpec NLRI components (RFC 5575)
-#[derive(Debug, Clone)]
-pub struct FlowSpecNlri {
-    pub dst_prefix: Option<Ipv4Net>,
-    pub src_prefix: Option<Ipv4Net>,
-    pub protocol: Vec<u8>,
-    pub dst_port: Vec<PortOperator>,
-    pub src_port: Vec<PortOperator>,
-    pub icmp_type: Vec<u8>,
-    pub icmp_code: Vec<u8>,
-    pub tcp_flags: Option<u8>,
-    pub packet_length: Vec<LengthOperator>,
-    pub dscp: Vec<u8>,
-    pub fragment: Option<u8>,
+use super::Prefix;
+
+/// FlowSpec component types (RFC 8955 Section 4)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, DekuRead, DekuWrite)]
+#[deku(id_type = "u8")]
+#[repr(u8)]
+pub enum ComponentType {
+    DestinationPrefix = 1,
+    SourcePrefix = 2,
+    IpProtocol = 3,
+    Port = 4,
+    DestinationPort = 5,
+    SourcePort = 6,
+    IcmpType = 7,
+    IcmpCode = 8,
+    TcpFlags = 9,
+    PacketLength = 10,
+    Dscp = 11,
+    Fragment = 12,
 }
 
-#[derive(Debug, Clone)]
-pub enum PortOperator {
-    Eq(u16),
-    Gt(u16),
-    Lt(u16),
-    Ge(u16),
-    Le(u16),
-    Range(u16, u16),
+/// Numeric operator for value comparisons
+/// Numeric operator for value comparisons (1 byte)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, DekuRead, DekuWrite)]
+pub struct NumericOp {
+    #[deku(bits = "1")]
+    pub end: bool,
+    #[deku(bits = "1")]
+    pub and: bool,
+    #[deku(bits = "2")]
+    pub len: u8, // 0=1byte, 1=2bytes, 2=4bytes, 3=8bytes
+    #[deku(bits = "1")]
+    pub reserved: bool,
+    #[deku(bits = "1")]
+    pub lt: bool,
+    #[deku(bits = "1")]
+    pub gt: bool,
+    #[deku(bits = "1")]
+    pub eq: bool,
 }
 
-#[derive(Debug, Clone)]
-pub enum LengthOperator {
-    Eq(u16),
-    Gt(u16),
-    Lt(u16),
-    Range(u16, u16),
+/// Bitmask operator for flag matching (1 byte)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, DekuRead, DekuWrite)]
+pub struct BitmaskOp {
+    #[deku(bits = "1")]
+    pub end: bool,
+    #[deku(bits = "1")]
+    pub and: bool,
+    #[deku(bits = "2")]
+    pub len: u8,
+    #[deku(bits = "2")]
+    pub reserved: u8,
+    #[deku(bits = "1")]
+    pub not: bool,
+    #[deku(bits = "1")]
+    pub match_: bool,
 }
 
-impl Default for FlowSpecNlri {
-    fn default() -> Self {
-        Self {
-            dst_prefix: None,
-            src_prefix: None,
-            protocol: Vec::new(),
-            dst_port: Vec::new(),
-            src_port: Vec::new(),
-            icmp_type: Vec::new(),
-            icmp_code: Vec::new(),
-            tcp_flags: None,
-            packet_length: Vec::new(),
-            dscp: Vec::new(),
-            fragment: None,
+/// Trait for operators with variable-length values
+trait Operator: Sized + for<'a> DekuReader<'a, ()> {
+    fn end(&self) -> bool;
+    fn value_len(&self) -> usize;
+}
+
+impl Operator for NumericOp {
+    fn end(&self) -> bool {
+        self.end
+    }
+    fn value_len(&self) -> usize {
+        1 << self.len
+    }
+}
+
+impl Operator for BitmaskOp {
+    fn end(&self) -> bool {
+        self.end
+    }
+    fn value_len(&self) -> usize {
+        1 << self.len
+    }
+}
+
+/// A match entry (operator + value)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Match<Op> {
+    pub op: Op,
+    pub value: u64,
+}
+
+pub type NumericMatch = Match<NumericOp>;
+pub type BitmaskMatch = Match<BitmaskOp>;
+
+/// FlowSpec component
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Component {
+    DestinationPrefix(Prefix),
+    SourcePrefix(Prefix),
+    IpProtocol(Vec<NumericMatch>),
+    Port(Vec<NumericMatch>),
+    DestinationPort(Vec<NumericMatch>),
+    SourcePort(Vec<NumericMatch>),
+    IcmpType(Vec<NumericMatch>),
+    IcmpCode(Vec<NumericMatch>),
+    TcpFlags(Vec<BitmaskMatch>),
+    PacketLength(Vec<NumericMatch>),
+    Dscp(Vec<NumericMatch>),
+    Fragment(Vec<BitmaskMatch>),
+}
+
+/// Parse operator+value matches until end bit is set
+fn parse_matches<R, Op>(reader: &mut deku::reader::Reader<R>) -> Result<Vec<Match<Op>>, DekuError>
+where
+    R: std::io::Read + std::io::Seek,
+    Op: Operator,
+{
+    let mut matches = Vec::new();
+    loop {
+        let op = Op::from_reader_with_ctx(reader, ())?;
+        let value = match op.value_len() {
+            1 => u8::from_reader_with_ctx(reader, ())? as u64,
+            2 => u16::from_reader_with_ctx(reader, deku::ctx::Endian::Big)? as u64,
+            4 => u32::from_reader_with_ctx(reader, deku::ctx::Endian::Big)? as u64,
+            8 => u64::from_reader_with_ctx(reader, deku::ctx::Endian::Big)?,
+            _ => return Err(DekuError::Parse("invalid length".into())),
+        };
+        let end = op.end();
+        matches.push(Match { op, value });
+        if end {
+            break;
         }
     }
+    Ok(matches)
+}
+
+/// Parse a single FlowSpec component
+fn parse_component<R: std::io::Read + std::io::Seek>(
+    reader: &mut deku::reader::Reader<R>,
+) -> Result<Component, DekuError> {
+    let component_type = ComponentType::from_reader_with_ctx(reader, ())?;
+
+    match component_type {
+        ComponentType::DestinationPrefix => Ok(Component::DestinationPrefix(
+            Prefix::from_reader_with_ctx(reader, ())?,
+        )),
+        ComponentType::SourcePrefix => Ok(Component::SourcePrefix(Prefix::from_reader_with_ctx(
+            reader,
+            (),
+        )?)),
+        ComponentType::IpProtocol => Ok(Component::IpProtocol(parse_matches(reader)?)),
+        ComponentType::Port => Ok(Component::Port(parse_matches(reader)?)),
+        ComponentType::DestinationPort => Ok(Component::DestinationPort(parse_matches(reader)?)),
+        ComponentType::SourcePort => Ok(Component::SourcePort(parse_matches(reader)?)),
+        ComponentType::IcmpType => Ok(Component::IcmpType(parse_matches(reader)?)),
+        ComponentType::IcmpCode => Ok(Component::IcmpCode(parse_matches(reader)?)),
+        ComponentType::TcpFlags => Ok(Component::TcpFlags(parse_matches(reader)?)),
+        ComponentType::PacketLength => Ok(Component::PacketLength(parse_matches(reader)?)),
+        ComponentType::Dscp => Ok(Component::Dscp(parse_matches(reader)?)),
+        ComponentType::Fragment => Ok(Component::Fragment(parse_matches(reader)?)),
+    }
+}
+
+/// FlowSpec NLRI
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowSpecNlri {
+    pub components: Vec<Component>,
 }
 
 impl FlowSpecNlri {
-    /// Parse FlowSpec NLRI from BGP UPDATE message bytes
-    pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.is_empty() {
-            return None;
-        }
+    pub fn from_bytes(data: &[u8]) -> Result<Self, DekuError> {
+        // Read length (1 or 2 bytes)
+        let (nlri_len, offset) = if data[0] >= 0xf0 {
+            let len = (((data[0] & 0x0f) as usize) << 8) | (data[1] as usize);
+            (len, 2)
+        } else {
+            (data[0] as usize, 1)
+        };
 
-        let mut nlri = FlowSpecNlri::default();
-        let mut offset = 0;
+        let nlri_data = &data[offset..offset + nlri_len];
+        Self::parse_components(nlri_data)
+    }
 
-        while offset < data.len() {
-            if offset >= data.len() {
+    fn parse_components(data: &[u8]) -> Result<Self, DekuError> {
+        let mut cursor = std::io::Cursor::new(data);
+        let mut reader = deku::reader::Reader::new(&mut cursor);
+        let mut components = Vec::new();
+        let len = data.len();
+
+        loop {
+            let pos = reader.bits_read / 8;
+            if pos >= len {
                 break;
             }
-
-            let component_type = data[offset];
-            offset += 1;
-
-            match component_type {
-                1 => {
-                    // Destination Prefix
-                    if offset + 1 > data.len() {
-                        break;
-                    }
-                    let prefix_len = data[offset] as usize;
-                    offset += 1;
-                    let byte_len = (prefix_len + 7) / 8;
-                    if offset + byte_len > data.len() {
-                        break;
-                    }
-                    let mut addr_bytes = [0u8; 4];
-                    for i in 0..byte_len.min(4) {
-                        addr_bytes[i] = data[offset + i];
-                    }
-                    offset += byte_len;
-                    let addr = Ipv4Addr::from(addr_bytes);
-                    nlri.dst_prefix = Ipv4Net::new(addr, prefix_len as u8).ok();
-                }
-                2 => {
-                    // Source Prefix
-                    if offset + 1 > data.len() {
-                        break;
-                    }
-                    let prefix_len = data[offset] as usize;
-                    offset += 1;
-                    let byte_len = (prefix_len + 7) / 8;
-                    if offset + byte_len > data.len() {
-                        break;
-                    }
-                    let mut addr_bytes = [0u8; 4];
-                    for i in 0..byte_len.min(4) {
-                        addr_bytes[i] = data[offset + i];
-                    }
-                    offset += byte_len;
-                    let addr = Ipv4Addr::from(addr_bytes);
-                    nlri.src_prefix = Ipv4Net::new(addr, prefix_len as u8).ok();
-                }
-                3 => {
-                    // IP Protocol
-                    let (protos, consumed) = parse_numeric_operator(&data[offset..]);
-                    for p in protos {
-                        nlri.protocol.push(p as u8);
-                    }
-                    offset += consumed;
-                }
-                4 => {
-                    // Destination Port
-                    let (ops, consumed) = parse_port_operator(&data[offset..]);
-                    nlri.dst_port.extend(ops);
-                    offset += consumed;
-                }
-                5 => {
-                    // Source Port
-                    let (ops, consumed) = parse_port_operator(&data[offset..]);
-                    nlri.src_port.extend(ops);
-                    offset += consumed;
-                }
-                6 => {
-                    // ICMP Type
-                    let (types, consumed) = parse_numeric_operator(&data[offset..]);
-                    for t in types {
-                        nlri.icmp_type.push(t as u8);
-                    }
-                    offset += consumed;
-                }
-                7 => {
-                    // ICMP Code
-                    let (codes, consumed) = parse_numeric_operator(&data[offset..]);
-                    for c in codes {
-                        nlri.icmp_code.push(c as u8);
-                    }
-                    offset += consumed;
-                }
-                9 => {
-                    // TCP Flags
-                    if offset + 2 <= data.len() {
-                        nlri.tcp_flags = Some(data[offset + 1]);
-                        offset += 2;
-                    }
-                }
-                10 => {
-                    // Packet Length
-                    let (ops, consumed) = parse_length_operator(&data[offset..]);
-                    nlri.packet_length.extend(ops);
-                    offset += consumed;
-                }
-                11 => {
-                    // DSCP
-                    let (dscps, consumed) = parse_numeric_operator(&data[offset..]);
-                    for d in dscps {
-                        nlri.dscp.push(d as u8);
-                    }
-                    offset += consumed;
-                }
-                12 => {
-                    // Fragment
-                    if offset + 2 <= data.len() {
-                        nlri.fragment = Some(data[offset + 1]);
-                        offset += 2;
-                    }
-                }
-                _ => {
-                    // Unknown component, skip
-                    break;
-                }
-            }
+            components.push(parse_component(&mut reader)?);
         }
 
-        Some(nlri)
-    }
-
-    pub fn to_rule(&self, rule_id: &str, action: FlowSpecAction, rate_limit_bps: Option<u64>) -> FlowSpecRule {
-        let mut rule = FlowSpecRule::new(rule_id, format!("bgp-{}", rule_id));
-
-        if let Some(prefix) = self.dst_prefix {
-            rule = rule.with_dst_prefix(prefix);
-        }
-
-        if let Some(prefix) = self.src_prefix {
-            rule = rule.with_src_prefix(prefix);
-        }
-
-        if let Some(&proto) = self.protocol.first() {
-            rule = rule.with_protocol(proto);
-        }
-
-        if let Some(op) = self.dst_port.first() {
-            match op {
-                PortOperator::Eq(p) => rule = rule.with_dst_port(*p, *p),
-                PortOperator::Range(start, end) => rule = rule.with_dst_port(*start, *end),
-                PortOperator::Ge(p) => rule = rule.with_dst_port(*p, 65535),
-                PortOperator::Le(p) => rule = rule.with_dst_port(0, *p),
-                PortOperator::Gt(p) => rule = rule.with_dst_port(p + 1, 65535),
-                PortOperator::Lt(p) => rule = rule.with_dst_port(0, p.saturating_sub(1)),
-            }
-        }
-
-        if let Some(op) = self.src_port.first() {
-            match op {
-                PortOperator::Eq(p) => rule = rule.with_src_port(*p, *p),
-                PortOperator::Range(start, end) => rule = rule.with_src_port(*start, *end),
-                PortOperator::Ge(p) => rule = rule.with_src_port(*p, 65535),
-                PortOperator::Le(p) => rule = rule.with_src_port(0, *p),
-                PortOperator::Gt(p) => rule = rule.with_src_port(p + 1, 65535),
-                PortOperator::Lt(p) => rule = rule.with_src_port(0, p.saturating_sub(1)),
-            }
-        }
-
-        rule = rule.with_action(action);
-
-        if let Some(rate) = rate_limit_bps {
-            rule = rule.with_rate_limit(rate);
-        }
-
-        rule
+        Ok(Self { components })
     }
 }
 
-fn parse_numeric_operator(data: &[u8]) -> (Vec<u16>, usize) {
-    let mut values = Vec::new();
-    let mut offset = 0;
+/// Traffic action extended community (RFC 8955 Section 7)
+#[derive(Debug, Clone, PartialEq, DekuRead, DekuWrite)]
+#[deku(id_type = "u16", endian = "big")]
+pub enum TrafficAction {
+    #[deku(id = 0x8006)]
+    RateBytes {
+        #[deku(endian = "big")]
+        as_number: u16,
+        #[deku(endian = "big")]
+        rate: f32,
+    },
+    #[deku(id = 0x800c)]
+    RatePackets {
+        #[deku(endian = "big")]
+        as_number: u16,
+        #[deku(endian = "big")]
+        rate: f32,
+    },
+    #[deku(id = 0x8007)]
+    Action {
+        #[deku(pad_bytes_before = "5", bits = "6")]
+        _reserved: u8,
+        #[deku(bits = "1")]
+        sample: bool,
+        #[deku(bits = "1")]
+        terminal: bool,
+    },
+    #[deku(id = 0x8008)]
+    RedirectAs2 {
+        #[deku(endian = "big")]
+        as_number: u16,
+        #[deku(endian = "big")]
+        value: u32,
+    },
+    #[deku(id = 0x8108)]
+    RedirectIpv4 {
+        #[deku(endian = "big")]
+        ipv4: u32,
+        #[deku(endian = "big")]
+        value: u16,
+    },
+    #[deku(id = 0x8208)]
+    RedirectAs4 {
+        #[deku(endian = "big")]
+        as_number: u32,
+        #[deku(endian = "big")]
+        value: u16,
+    },
+    #[deku(id = 0x8009)]
+    TrafficMarking {
+        #[deku(pad_bytes_before = "5", bits = "2")]
+        _reserved: u8,
+        #[deku(bits = "6")]
+        dscp: u8,
+    },
+}
 
-    while offset < data.len() {
-        let op_byte = data[offset];
-        let end_bit = (op_byte & 0x80) != 0;
-        let value_len = if (op_byte & 0x10) != 0 { 2 } else { 1 };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        offset += 1;
+    #[test]
+    fn test_numeric_op_parse() {
+        // End bit set, eq=true, 1-byte value
+        let data = [0x81, 0x06]; // TCP protocol
+        let mut cursor = std::io::Cursor::new(&data);
+        let mut reader = deku::reader::Reader::new(&mut cursor);
 
-        if offset + value_len > data.len() {
-            break;
-        }
+        let op = NumericOp::from_reader_with_ctx(&mut reader, ()).unwrap();
+        assert!(op.end);
+        assert!(!op.and);
+        assert_eq!(op.len, 0); // 1 byte
+        assert!(op.eq);
+        assert!(!op.lt);
+        assert!(!op.gt);
+    }
 
-        let value = if value_len == 2 {
-            u16::from_be_bytes([data[offset], data[offset + 1]])
+    #[test]
+    fn test_flowspec_dest_prefix() {
+        // Length=5, Type=1 (dest), prefixlen=24, prefix=192.168.1
+        let data = [0x05, 0x01, 0x18, 0xC0, 0xA8, 0x01];
+        let nlri = FlowSpecNlri::from_bytes(&data).unwrap();
+        assert_eq!(nlri.components.len(), 1);
+
+        if let Component::DestinationPrefix(prefix) = &nlri.components[0] {
+            assert_eq!(prefix.length, 24);
+            assert_eq!(prefix.prefix, vec![0xC0, 0xA8, 0x01]);
         } else {
-            data[offset] as u16
-        };
-        values.push(value);
-        offset += value_len;
-
-        if end_bit {
-            break;
+            panic!("expected DestinationPrefix");
         }
     }
 
-    (values, offset)
-}
+    #[test]
+    fn test_flowspec_dest_port() {
+        // Length=3, Type=5 (dest port), op=0x81 (end, eq), value=80
+        let data = [0x03, 0x05, 0x81, 0x50];
+        let nlri = FlowSpecNlri::from_bytes(&data).unwrap();
 
-fn parse_port_operator(data: &[u8]) -> (Vec<PortOperator>, usize) {
-    let mut ops = Vec::new();
-    let mut offset = 0;
-
-    while offset < data.len() {
-        let op_byte = data[offset];
-        let end_bit = (op_byte & 0x80) != 0;
-        let lt_bit = (op_byte & 0x04) != 0;
-        let gt_bit = (op_byte & 0x02) != 0;
-        let eq_bit = (op_byte & 0x01) != 0;
-        let value_len = if (op_byte & 0x10) != 0 { 2 } else { 1 };
-
-        offset += 1;
-
-        if offset + value_len > data.len() {
-            break;
-        }
-
-        let value = if value_len == 2 {
-            u16::from_be_bytes([data[offset], data[offset + 1]])
+        if let Component::DestinationPort(matches) = &nlri.components[0] {
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].value, 80);
+            assert!(matches[0].op.eq);
         } else {
-            data[offset] as u16
-        };
-        offset += value_len;
-
-        let op = match (lt_bit, gt_bit, eq_bit) {
-            (false, false, true) => PortOperator::Eq(value),
-            (true, false, false) => PortOperator::Lt(value),
-            (false, true, false) => PortOperator::Gt(value),
-            (true, false, true) => PortOperator::Le(value),
-            (false, true, true) => PortOperator::Ge(value),
-            _ => PortOperator::Eq(value),
-        };
-        ops.push(op);
-
-        if end_bit {
-            break;
+            panic!("expected DestinationPort");
         }
     }
 
-    (ops, offset)
-}
+    #[test]
+    fn test_traffic_action_rate() {
+        // Type 0x8006 (rate-bytes), AS=0, rate=0.0 (drop)
+        let data = [0x80, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let (_, action) = TrafficAction::from_bytes((&data, 0)).unwrap();
 
-fn parse_length_operator(data: &[u8]) -> (Vec<LengthOperator>, usize) {
-    let mut ops = Vec::new();
-    let mut offset = 0;
-
-    while offset < data.len() {
-        let op_byte = data[offset];
-        let end_bit = (op_byte & 0x80) != 0;
-        let lt_bit = (op_byte & 0x04) != 0;
-        let gt_bit = (op_byte & 0x02) != 0;
-        let eq_bit = (op_byte & 0x01) != 0;
-        let value_len = if (op_byte & 0x10) != 0 { 2 } else { 1 };
-
-        offset += 1;
-
-        if offset + value_len > data.len() {
-            break;
-        }
-
-        let value = if value_len == 2 {
-            u16::from_be_bytes([data[offset], data[offset + 1]])
+        if let TrafficAction::RateBytes { as_number, rate } = action {
+            assert_eq!(as_number, 0);
+            assert_eq!(rate, 0.0);
         } else {
-            data[offset] as u16
-        };
-        offset += value_len;
-
-        let op = match (lt_bit, gt_bit, eq_bit) {
-            (false, false, true) => LengthOperator::Eq(value),
-            (true, false, false) => LengthOperator::Lt(value),
-            (false, true, false) => LengthOperator::Gt(value),
-            _ => LengthOperator::Eq(value),
-        };
-        ops.push(op);
-
-        if end_bit {
-            break;
+            panic!("expected RateBytes");
         }
     }
 
-    (ops, offset)
-}
+    #[test]
+    fn test_traffic_action_marking() {
+        // Type 0x8009 (traffic-marking), DSCP=46 (EF)
+        let data = [0x80, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2E];
+        let (_, action) = TrafficAction::from_bytes((&data, 0)).unwrap();
 
-/// Parse FlowSpec extended community for traffic action
-pub fn parse_traffic_action(community: &[u8]) -> Option<(FlowSpecAction, Option<u64>)> {
-    if community.len() < 8 {
-        return None;
-    }
-
-    let type_high = community[0];
-    let type_low = community[1];
-
-    match (type_high, type_low) {
-        (0x80, 0x06) => {
-            // Traffic-rate (rate-limit)
-            let rate = f32::from_be_bytes([
-                community[4],
-                community[5],
-                community[6],
-                community[7],
-            ]);
-            if rate == 0.0 {
-                Some((FlowSpecAction::Drop, None))
-            } else {
-                Some((FlowSpecAction::RateLimit, Some((rate * 8.0) as u64)))
-            }
+        if let TrafficAction::TrafficMarking { dscp, .. } = action {
+            assert_eq!(dscp, 46);
+        } else {
+            panic!("expected TrafficMarking");
         }
-        (0x80, 0x07) => {
-            // Traffic-action
-            let action_byte = community[7];
-            if action_byte & 0x02 != 0 {
-                // Terminal action - drop
-                Some((FlowSpecAction::Drop, None))
-            } else {
-                Some((FlowSpecAction::Accept, None))
-            }
-        }
-        _ => None,
     }
 }
