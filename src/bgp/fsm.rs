@@ -6,7 +6,7 @@ use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
-use super::command::Command;
+use super::command::PipeCommand;
 use super::flowspec::{FlowSpecNlri, TrafficAction};
 use super::session::{Message, Session, SessionError};
 use super::update_builder::UpdateBuilder;
@@ -97,7 +97,7 @@ pub enum FsmEvent {
 
     // === Command Events ===
     /// Command received from named pipe
-    CommandReceived(Command),
+    CommandReceived(PipeCommand),
 }
 
 impl std::fmt::Display for FsmEvent {
@@ -165,12 +165,8 @@ pub enum FsmError {
     Session(#[from] SessionError),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Hold timer expired")]
-    HoldTimerExpired,
     #[error("Peer sent NOTIFICATION: {0}")]
     PeerNotification(Notification),
-    #[error("Connection closed")]
-    ConnectionClosed,
 }
 
 /// FSM configuration
@@ -228,12 +224,6 @@ impl TimerState {
         Self { deadline: None }
     }
 
-    fn start(&mut self, duration: Duration) {
-        if !duration.is_zero() {
-            self.deadline = Some(tokio::time::Instant::now() + duration);
-        }
-    }
-
     fn start_if_runtime_available(&mut self, duration: Duration) {
         // Only set the deadline if we're in a Tokio runtime
         // This allows tests to run without a runtime
@@ -247,10 +237,6 @@ impl TimerState {
 
     fn stop(&mut self) {
         self.deadline = None;
-    }
-
-    fn is_running(&self) -> bool {
-        self.deadline.is_some()
     }
 }
 
@@ -286,8 +272,8 @@ pub struct Fsm {
     /// Keepalive timer state
     keepalive_timer: TimerState,
 
-    /// Command receiver for FlowSpec injection
-    command_rx: Option<mpsc::Receiver<Command>>,
+    /// Command receiver for FlowSpec injection and control commands
+    command_rx: Option<mpsc::Receiver<PipeCommand>>,
 }
 
 impl Fsm {
@@ -308,8 +294,8 @@ impl Fsm {
         }
     }
 
-    /// Set the command receiver for FlowSpec injection
-    pub fn set_command_receiver(&mut self, rx: mpsc::Receiver<Command>) {
+    /// Set the command receiver for FlowSpec injection and control commands
+    pub fn set_command_receiver(&mut self, rx: mpsc::Receiver<PipeCommand>) {
         self.command_rx = Some(rx);
     }
 
@@ -326,11 +312,6 @@ impl Fsm {
     /// Get negotiated hold time
     pub fn negotiated_hold_time(&self) -> Option<Duration> {
         self.negotiated_hold_time
-    }
-
-    /// Set the TCP session (used after external TCP connection)
-    pub fn set_session(&mut self, session: Session) {
-        self.session = Some(session);
     }
 
     // === Timer Management ===
@@ -418,8 +399,15 @@ impl Fsm {
     fn transition(&mut self, event: FsmEvent) -> (FsmState, FsmAction) {
         match (&self.state, event) {
             // === Command Events ===
-            // Handle command in Established state - send UPDATE
-            (FsmState::Established, FsmEvent::CommandReceived(cmd)) => {
+            // Handle shutdown command in any state - triggers ManualStop
+            (_, FsmEvent::CommandReceived(PipeCommand::Shutdown)) => {
+                eprintln!("FSM: Shutdown command received");
+                // Delegate to ManualStop handling
+                return self.transition(FsmEvent::ManualStop);
+            }
+
+            // Handle FlowSpec command in Established state - send UPDATE
+            (FsmState::Established, FsmEvent::CommandReceived(PipeCommand::FlowSpec(cmd))) => {
                 use super::command::Operation;
 
                 let (announce, withdraw) = match cmd.operation {
@@ -436,9 +424,9 @@ impl Fsm {
                 (FsmState::Established, FsmAction::SendUpdate { announce, withdraw })
             }
 
-            // Ignore command in non-Established states
-            (_, FsmEvent::CommandReceived(_)) => {
-                eprintln!("FSM: Command ignored - session not established");
+            // Ignore FlowSpec command in non-Established states
+            (_, FsmEvent::CommandReceived(PipeCommand::FlowSpec(_))) => {
+                eprintln!("FSM: FlowSpec command ignored - session not established");
                 (self.state, FsmAction::None)
             }
 
@@ -962,7 +950,7 @@ impl Fsm {
                     if let Some(ref mut rx) = self.command_rx {
                         rx.recv().await
                     } else {
-                        std::future::pending::<Option<Command>>().await
+                        std::future::pending::<Option<PipeCommand>>().await
                     }
                 } => {
                     if let Some(cmd) = result {
@@ -981,12 +969,28 @@ impl Fsm {
                 } => {
                     match result {
                         Ok(Message::Open(open)) => {
+                            // Validate OPEN message per RFC 4271 Section 6.2
+                            if let Err(e) = open.validate(self.config.bgp_id) {
+                                eprintln!("FSM: OPEN validation failed: {}", e.description);
+                                return Ok(FsmEvent::BgpOpenMsgErr {
+                                    subcode: e.subcode,
+                                    data: e.data,
+                                });
+                            }
                             return Ok(FsmEvent::BgpOpen(open));
                         }
                         Ok(Message::Keepalive) => {
                             return Ok(FsmEvent::KeepAliveMsg);
                         }
                         Ok(Message::Update(update)) => {
+                            // Validate UPDATE message per RFC 4271 Section 6.3
+                            if let Err(e) = update.validate() {
+                                eprintln!("FSM: UPDATE validation failed: {}", e.description);
+                                return Ok(FsmEvent::UpdateMsgErr {
+                                    subcode: e.subcode,
+                                    data: e.data,
+                                });
+                            }
                             return Ok(FsmEvent::UpdateMsg(update));
                         }
                         Ok(Message::Notification(n)) => {
@@ -1004,9 +1008,6 @@ impl Fsm {
                                 subcode: 1, // Connection Not Synchronized
                                 data: vec![],
                             });
-                        }
-                        Err(SessionError::PeerNotification(n)) => {
-                            return Ok(FsmEvent::NotifMsg(n));
                         }
                         Err(_) => {
                             return Ok(FsmEvent::TcpConnectionFails);
@@ -1311,5 +1312,153 @@ mod tests {
         let action = fsm.handle_event(FsmEvent::KeepAliveMsg);
         assert_eq!(fsm.state(), FsmState::Established);
         assert!(matches!(action, FsmAction::None));
+    }
+
+    #[test]
+    fn test_shutdown_command_triggers_manual_stop() {
+        use crate::bgp::command::PipeCommand;
+
+        let mut fsm = Fsm::new(test_config());
+        fsm.handle_event(FsmEvent::ManualStart);
+        fsm.handle_event(FsmEvent::TcpConnectionConfirmed);
+        let peer_open = Open::new(65002, 90, 0x0A000002);
+        fsm.handle_event(FsmEvent::BgpOpen(peer_open));
+        fsm.handle_event(FsmEvent::KeepAliveMsg);
+        assert_eq!(fsm.state(), FsmState::Established);
+
+        // Shutdown command should trigger ManualStop -> Idle
+        let action = fsm.handle_event(FsmEvent::CommandReceived(PipeCommand::Shutdown));
+        assert_eq!(fsm.state(), FsmState::Idle);
+        assert!(matches!(
+            action,
+            FsmAction::SendNotification {
+                error_code: ErrorCode::Cease,
+                subcode: 2, // Administrative Shutdown
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_manual_stop_from_any_state() {
+        // Test ManualStop from Connect state
+        let mut fsm = Fsm::new(test_config());
+        fsm.handle_event(FsmEvent::ManualStart);
+        assert_eq!(fsm.state(), FsmState::Connect);
+
+        let action = fsm.handle_event(FsmEvent::ManualStop);
+        assert_eq!(fsm.state(), FsmState::Idle);
+        assert!(matches!(action, FsmAction::ReleaseResources));
+
+        // Test ManualStop from Active state
+        let mut fsm = Fsm::new(test_config());
+        fsm.handle_event(FsmEvent::ManualStartWithPassiveTcp);
+        assert_eq!(fsm.state(), FsmState::Active);
+
+        let action = fsm.handle_event(FsmEvent::ManualStop);
+        assert_eq!(fsm.state(), FsmState::Idle);
+        assert!(matches!(action, FsmAction::ReleaseResources));
+    }
+
+    #[test]
+    fn test_bgp_open_msg_err_in_opensent() {
+        let mut fsm = Fsm::new(test_config());
+        fsm.handle_event(FsmEvent::ManualStart);
+        fsm.handle_event(FsmEvent::TcpConnectionConfirmed);
+        assert_eq!(fsm.state(), FsmState::OpenSent);
+
+        // Simulate receiving invalid OPEN (bad hold time)
+        let action = fsm.handle_event(FsmEvent::BgpOpenMsgErr {
+            subcode: 6, // Unacceptable Hold Time
+            data: vec![],
+        });
+
+        assert_eq!(fsm.state(), FsmState::Idle);
+        assert!(matches!(
+            action,
+            FsmAction::SendNotification {
+                error_code: ErrorCode::OpenMessage,
+                subcode: 6,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_bgp_open_msg_err_bad_bgp_id() {
+        let mut fsm = Fsm::new(test_config());
+        fsm.handle_event(FsmEvent::ManualStart);
+        fsm.handle_event(FsmEvent::TcpConnectionConfirmed);
+        assert_eq!(fsm.state(), FsmState::OpenSent);
+
+        // Simulate receiving invalid OPEN (bad BGP identifier)
+        let action = fsm.handle_event(FsmEvent::BgpOpenMsgErr {
+            subcode: 3, // Bad BGP Identifier
+            data: vec![],
+        });
+
+        assert_eq!(fsm.state(), FsmState::Idle);
+        assert!(matches!(
+            action,
+            FsmAction::SendNotification {
+                error_code: ErrorCode::OpenMessage,
+                subcode: 3,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_update_msg_err_in_established() {
+        let mut fsm = Fsm::new(test_config());
+        fsm.handle_event(FsmEvent::ManualStart);
+        fsm.handle_event(FsmEvent::TcpConnectionConfirmed);
+        let peer_open = Open::new(65002, 90, 0x0A000002);
+        fsm.handle_event(FsmEvent::BgpOpen(peer_open));
+        fsm.handle_event(FsmEvent::KeepAliveMsg);
+        assert_eq!(fsm.state(), FsmState::Established);
+
+        // Simulate receiving malformed UPDATE
+        let action = fsm.handle_event(FsmEvent::UpdateMsgErr {
+            subcode: 1, // Malformed Attribute List
+            data: vec![],
+        });
+
+        assert_eq!(fsm.state(), FsmState::Idle);
+        assert!(matches!(
+            action,
+            FsmAction::SendNotification {
+                error_code: ErrorCode::UpdateMessage,
+                subcode: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_update_msg_err_invalid_origin() {
+        let mut fsm = Fsm::new(test_config());
+        fsm.handle_event(FsmEvent::ManualStart);
+        fsm.handle_event(FsmEvent::TcpConnectionConfirmed);
+        let peer_open = Open::new(65002, 90, 0x0A000002);
+        fsm.handle_event(FsmEvent::BgpOpen(peer_open));
+        fsm.handle_event(FsmEvent::KeepAliveMsg);
+        assert_eq!(fsm.state(), FsmState::Established);
+
+        // Simulate receiving UPDATE with invalid ORIGIN
+        let action = fsm.handle_event(FsmEvent::UpdateMsgErr {
+            subcode: 6, // Invalid ORIGIN Attribute
+            data: vec![5], // The invalid origin value
+        });
+
+        assert_eq!(fsm.state(), FsmState::Idle);
+        assert!(matches!(
+            action,
+            FsmAction::SendNotification {
+                error_code: ErrorCode::UpdateMessage,
+                subcode: 6,
+                ..
+            }
+        ));
     }
 }

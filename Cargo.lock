@@ -219,6 +219,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
+name = "flowspecd"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "deku",
+ "nix",
+ "num-derive",
+ "num-traits",
+ "prometheus",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "thiserror 2.0.18",
+ "tiny_http",
+ "tokio",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -505,24 +523,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
-]
-
-[[package]]
-name = "rust-router"
-version = "0.1.0"
-dependencies = [
- "clap",
- "deku",
- "nix",
- "num-derive",
- "num-traits",
- "prometheus",
- "serde",
- "serde_json",
- "sysinfo",
- "thiserror 2.0.18",
- "tiny_http",
- "tokio",
 ]
 
 [[package]]

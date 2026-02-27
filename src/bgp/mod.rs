@@ -266,6 +266,28 @@ impl Header {
     }
 }
 
+/// OPEN message validation error (RFC 4271 Section 6.2)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenValidationError {
+    /// Subcode for NOTIFICATION (ErrorCode::OpenMessage)
+    pub subcode: u8,
+    /// Data to include in NOTIFICATION
+    pub data: Vec<u8>,
+    /// Human-readable description
+    pub description: String,
+}
+
+/// UPDATE message validation error (RFC 4271 Section 6.3)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateValidationError {
+    /// Subcode for NOTIFICATION (ErrorCode::UpdateMessage)
+    pub subcode: u8,
+    /// Data to include in NOTIFICATION (often the malformed attribute)
+    pub data: Vec<u8>,
+    /// Human-readable description
+    pub description: String,
+}
+
 impl Open {
     pub fn new(my_as: u16, hold_time: u16, bgp_id: u32) -> Self {
         Self {
@@ -293,12 +315,102 @@ impl Open {
             opt_params,
         }
     }
+
+    /// Validate OPEN message per RFC 4271 Section 6.2
+    ///
+    /// Returns Ok(()) if valid, or Err with subcode and data for NOTIFICATION
+    pub fn validate(&self, my_bgp_id: u32) -> Result<(), OpenValidationError> {
+        // Check hold time: must be 0 (no keepalives) or >= 3 seconds
+        // Hold time of 1 or 2 is invalid per RFC 4271
+        if self.hold_time == 1 || self.hold_time == 2 {
+            return Err(OpenValidationError {
+                subcode: 6, // Unacceptable Hold Time
+                data: vec![],
+                description: format!(
+                    "Unacceptable hold time: {} (must be 0 or >= 3)",
+                    self.hold_time
+                ),
+            });
+        }
+
+        // Check BGP Identifier: cannot be 0.0.0.0
+        if self.bgp_id == 0x00000000 {
+            return Err(OpenValidationError {
+                subcode: 3, // Bad BGP Identifier
+                data: vec![],
+                description: "Bad BGP Identifier: 0.0.0.0 is not valid".to_string(),
+            });
+        }
+
+        // Check BGP Identifier: cannot be 255.255.255.255
+        if self.bgp_id == 0xFFFFFFFF {
+            return Err(OpenValidationError {
+                subcode: 3, // Bad BGP Identifier
+                data: vec![],
+                description: "Bad BGP Identifier: 255.255.255.255 is not valid".to_string(),
+            });
+        }
+
+        // Check BGP Identifier: cannot be same as our own
+        if self.bgp_id == my_bgp_id {
+            return Err(OpenValidationError {
+                subcode: 3, // Bad BGP Identifier
+                data: vec![],
+                description: format!(
+                    "Bad BGP Identifier: {:08X} is same as local BGP ID",
+                    self.bgp_id
+                ),
+            });
+        }
+
+        Ok(())
+    }
 }
 
 impl Update {
     /// Parse path attributes from raw bytes
     pub fn parse_attributes(&self) -> Result<Vec<attributes::PathAttribute>, DekuError> {
         attributes::parse_path_attributes(&self.path_attributes)
+    }
+
+    /// Validate UPDATE message per RFC 4271 Section 6.3
+    ///
+    /// Returns Ok(parsed_attributes) if valid, or Err with subcode and data for NOTIFICATION
+    pub fn validate(&self) -> Result<Vec<attributes::PathAttribute>, UpdateValidationError> {
+        // Try to parse attributes - if this fails, it's a malformed attribute list
+        let attrs = self.parse_attributes().map_err(|e| UpdateValidationError {
+            subcode: 1, // Malformed Attribute List
+            data: vec![],
+            description: format!("Malformed attribute list: {}", e),
+        })?;
+
+        // Validate ORIGIN attribute if present (must be 0=IGP, 1=EGP, or 2=INCOMPLETE)
+        for attr in &attrs {
+            if let attributes::PathAttribute::Origin(origin) = attr {
+                if *origin > 2 {
+                    return Err(UpdateValidationError {
+                        subcode: 6, // Invalid ORIGIN Attribute
+                        data: vec![*origin],
+                        description: format!(
+                            "Invalid ORIGIN attribute: {} (must be 0, 1, or 2)",
+                            origin
+                        ),
+                    });
+                }
+            }
+        }
+
+        // Validate withdrawn routes length doesn't exceed message
+        if self.withdrawn_len as usize > self.path_attributes.len() + 100 {
+            // Rough sanity check
+            return Err(UpdateValidationError {
+                subcode: 1, // Malformed Attribute List
+                data: vec![],
+                description: "Withdrawn routes length exceeds reasonable bounds".to_string(),
+            });
+        }
+
+        Ok(attrs)
     }
 }
 
@@ -333,5 +445,117 @@ mod tests {
         let (_, prefix) = Prefix::from_bytes((&data, 0)).unwrap();
         assert_eq!(prefix.length, 24);
         assert_eq!(prefix.prefix, vec![0xC0, 0xA8, 0x01]);
+    }
+
+    #[test]
+    fn test_open_validation_valid() {
+        let open = Open::new(65001, 180, 0x0A000002);
+        let my_bgp_id = 0x0A000001;
+        assert!(open.validate(my_bgp_id).is_ok());
+    }
+
+    #[test]
+    fn test_open_validation_hold_time_zero() {
+        // Hold time 0 is valid (means no keepalives)
+        let open = Open::new(65001, 0, 0x0A000002);
+        let my_bgp_id = 0x0A000001;
+        assert!(open.validate(my_bgp_id).is_ok());
+    }
+
+    #[test]
+    fn test_open_validation_hold_time_invalid() {
+        // Hold time 1 is invalid
+        let open = Open::new(65001, 1, 0x0A000002);
+        let my_bgp_id = 0x0A000001;
+        let err = open.validate(my_bgp_id).unwrap_err();
+        assert_eq!(err.subcode, 6); // Unacceptable Hold Time
+
+        // Hold time 2 is invalid
+        let open = Open::new(65001, 2, 0x0A000002);
+        let err = open.validate(my_bgp_id).unwrap_err();
+        assert_eq!(err.subcode, 6);
+
+        // Hold time 3 is valid
+        let open = Open::new(65001, 3, 0x0A000002);
+        assert!(open.validate(my_bgp_id).is_ok());
+    }
+
+    #[test]
+    fn test_open_validation_bad_bgp_id_zero() {
+        let open = Open::new(65001, 180, 0x00000000);
+        let my_bgp_id = 0x0A000001;
+        let err = open.validate(my_bgp_id).unwrap_err();
+        assert_eq!(err.subcode, 3); // Bad BGP Identifier
+    }
+
+    #[test]
+    fn test_open_validation_bad_bgp_id_broadcast() {
+        let open = Open::new(65001, 180, 0xFFFFFFFF);
+        let my_bgp_id = 0x0A000001;
+        let err = open.validate(my_bgp_id).unwrap_err();
+        assert_eq!(err.subcode, 3); // Bad BGP Identifier
+    }
+
+    #[test]
+    fn test_open_validation_same_bgp_id() {
+        let open = Open::new(65001, 180, 0x0A000001);
+        let my_bgp_id = 0x0A000001; // Same as peer's
+        let err = open.validate(my_bgp_id).unwrap_err();
+        assert_eq!(err.subcode, 3); // Bad BGP Identifier
+    }
+
+    #[test]
+    fn test_update_validation_valid() {
+        // Valid UPDATE with ORIGIN=0 (IGP)
+        let update = Update {
+            withdrawn_len: 0,
+            withdrawn_routes: vec![],
+            path_attr_len: 4,
+            path_attributes: vec![0x40, 0x01, 0x01, 0x00], // ORIGIN=IGP
+            nlri: vec![],
+        };
+        assert!(update.validate().is_ok());
+    }
+
+    #[test]
+    fn test_update_validation_invalid_origin() {
+        // Invalid UPDATE with ORIGIN=5 (invalid)
+        let update = Update {
+            withdrawn_len: 0,
+            withdrawn_routes: vec![],
+            path_attr_len: 4,
+            path_attributes: vec![0x40, 0x01, 0x01, 0x05], // ORIGIN=5 (invalid)
+            nlri: vec![],
+        };
+        let err = update.validate().unwrap_err();
+        assert_eq!(err.subcode, 6); // Invalid ORIGIN Attribute
+        assert_eq!(err.data, vec![5]); // Contains the invalid value
+    }
+
+    #[test]
+    fn test_update_validation_empty() {
+        // Empty UPDATE (valid - used for keepalive-like behavior)
+        let update = Update {
+            withdrawn_len: 0,
+            withdrawn_routes: vec![],
+            path_attr_len: 0,
+            path_attributes: vec![],
+            nlri: vec![],
+        };
+        assert!(update.validate().is_ok());
+    }
+
+    #[test]
+    fn test_update_validation_malformed() {
+        // Malformed attributes (truncated)
+        let update = Update {
+            withdrawn_len: 0,
+            withdrawn_routes: vec![],
+            path_attr_len: 10,
+            path_attributes: vec![0x40, 0x01], // Truncated - missing length and value
+            nlri: vec![],
+        };
+        let err = update.validate().unwrap_err();
+        assert_eq!(err.subcode, 1); // Malformed Attribute List
     }
 }

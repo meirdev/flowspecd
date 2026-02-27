@@ -1,5 +1,5 @@
 [package]
-name = "rust-router"
+name = "flowspecd"
 version = "0.1.0"
 edition = "2021"
 description = "Minimal router with BGP FlowSpec and IPFIX support"

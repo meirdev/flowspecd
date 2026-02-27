@@ -1,13 +1,10 @@
 use deku::prelude::*;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
 use super::attributes::PathAttribute;
 use super::{ErrorCode, Header, MessageType, Notification, Open, Safi, Update, BGP_HEADER_LEN};
-
-#[allow(dead_code)]
-pub const BGP_PORT: u16 = 179;
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -15,20 +12,12 @@ pub enum SessionError {
     Io(#[from] std::io::Error),
     #[error("Parse error: {0}")]
     Parse(#[from] DekuError),
-    #[error("Unexpected message type: expected {expected:?}, got {got:?}")]
-    UnexpectedMessage {
-        expected: MessageType,
-        got: MessageType,
-    },
-    #[error("Peer sent NOTIFICATION: {0}")]
-    PeerNotification(Notification),
 }
 
 pub type Result<T> = std::result::Result<T, SessionError>;
 
 /// Received BGP message
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum Message {
     Open(Open),
     Update(Update),
@@ -54,27 +43,21 @@ impl Session {
         }
     }
 
-    pub async fn connect(addr: &str, my_as: u16, bgp_id: u32, hold_time: u16) -> Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
-        Ok(Self::new(stream, my_as, bgp_id, hold_time))
-    }
-
-    pub async fn listen(addr: &str, my_as: u16, bgp_id: u32, hold_time: u16) -> Result<Self> {
-        let listener = TcpListener::bind(addr).await?;
-        let (stream, peer_addr) = listener.accept().await?;
-        eprintln!("DEBUG: Accepted connection from {}", peer_addr);
-        Ok(Self::new(stream, my_as, bgp_id, hold_time))
-    }
-
     pub async fn send_open(&mut self) -> Result<()> {
         let open = Open::with_flowspec(self.my_as, self.hold_time, self.bgp_id);
         let body = open.to_bytes()?;
         let header = Header::new(MessageType::Open, body.len() as u16);
 
-        eprintln!("DEBUG: Sending OPEN - AS:{} BGP-ID:{:08X} Hold:{}",
-            self.my_as, self.bgp_id, self.hold_time);
+        eprintln!(
+            "DEBUG: Sending OPEN - AS:{} BGP-ID:{:08X} Hold:{}",
+            self.my_as, self.bgp_id, self.hold_time
+        );
         let header_bytes = header.to_bytes()?;
-        eprintln!("DEBUG: Header ({} bytes): {:02X?}", header_bytes.len(), header_bytes);
+        eprintln!(
+            "DEBUG: Header ({} bytes): {:02X?}",
+            header_bytes.len(),
+            header_bytes
+        );
         eprintln!("DEBUG: OPEN body ({} bytes): {:02X?}", body.len(), body);
 
         self.stream.write_all(&header_bytes).await?;
@@ -116,7 +99,11 @@ impl Session {
         let header_bytes = header.to_bytes()?;
 
         eprintln!("DEBUG: Sending UPDATE ({} bytes body)", body.len());
-        eprintln!("DEBUG: Header ({} bytes): {:02X?}", header_bytes.len(), header_bytes);
+        eprintln!(
+            "DEBUG: Header ({} bytes): {:02X?}",
+            header_bytes.len(),
+            header_bytes
+        );
         eprintln!("DEBUG: Body: {:02X?}", body);
 
         self.stream.write_all(&header_bytes).await?;
@@ -126,93 +113,30 @@ impl Session {
         Ok(())
     }
 
-    pub async fn read_header(&mut self) -> Result<Header> {
+    async fn read_header(&mut self) -> Result<Header> {
         let mut buf = [0u8; BGP_HEADER_LEN];
         self.stream.read_exact(&mut buf).await?;
         let (_, header) = Header::from_bytes((&buf, 0))?;
-        eprintln!("DEBUG: Read header - type:{:?} length:{}", header.message_type, header.length);
+        eprintln!(
+            "DEBUG: Read header - type:{:?} length:{}",
+            header.message_type, header.length
+        );
         Ok(header)
     }
 
-    pub async fn read_open(&mut self, body_len: usize) -> Result<Open> {
+    async fn read_open(&mut self, body_len: usize) -> Result<Open> {
         let mut buf = vec![0u8; body_len];
         self.stream.read_exact(&mut buf).await?;
-        eprintln!("DEBUG: Received OPEN body ({} bytes): {:02X?}", body_len, buf);
+        eprintln!(
+            "DEBUG: Received OPEN body ({} bytes): {:02X?}",
+            body_len, buf
+        );
         let (_, open) = Open::from_bytes((&buf, 0))?;
-        eprintln!("DEBUG: Parsed OPEN - AS:{} BGP-ID:{:08X} Hold:{}",
-            open.my_as, open.bgp_id, open.hold_time);
+        eprintln!(
+            "DEBUG: Parsed OPEN - AS:{} BGP-ID:{:08X} Hold:{}",
+            open.my_as, open.bgp_id, open.hold_time
+        );
         Ok(open)
-    }
-
-    async fn read_notification(&mut self, body_len: usize) -> Result<Notification> {
-        let mut buf = vec![0u8; body_len];
-        self.stream.read_exact(&mut buf).await?;
-        let (_, notification) = Notification::from_bytes((&buf, 0))?;
-        Ok(notification)
-    }
-
-    /// Handle unexpected message type, reading notification if that's what we got
-    async fn expect_message(
-        &mut self,
-        header: &Header,
-        expected: MessageType,
-    ) -> Result<()> {
-        if header.message_type == expected {
-            return Ok(());
-        }
-
-        if header.message_type == MessageType::Notification {
-            let body_len = header.length as usize - BGP_HEADER_LEN;
-            let notification = self.read_notification(body_len).await?;
-            eprintln!("DEBUG: Received NOTIFICATION: {}", notification);
-            return Err(SessionError::PeerNotification(notification));
-        }
-
-        Err(SessionError::UnexpectedMessage {
-            expected,
-            got: header.message_type,
-        })
-    }
-
-    pub async fn handshake(&mut self) -> Result<Open> {
-        self.send_open().await?;
-
-        let header = self.read_header().await?;
-        self.expect_message(&header, MessageType::Open).await?;
-
-        let body_len = header.length as usize - BGP_HEADER_LEN;
-        let peer_open = self.read_open(body_len).await?;
-
-        self.send_keepalive().await?;
-
-        let header = self.read_header().await?;
-        self.expect_message(&header, MessageType::Keepalive).await?;
-
-        Ok(peer_open)
-    }
-
-    /// Server-side handshake: wait for peer's OPEN, then respond
-    pub async fn accept_handshake(&mut self) -> Result<Open> {
-        eprintln!("DEBUG: accept_handshake starting, waiting for peer OPEN...");
-
-        // 1. Wait for peer's OPEN (they initiated, they send first)
-        let header = self.read_header().await?;
-        self.expect_message(&header, MessageType::Open).await?;
-
-        let body_len = header.length as usize - BGP_HEADER_LEN;
-        let peer_open = self.read_open(body_len).await?;
-
-        // 2. Send our OPEN
-        self.send_open().await?;
-
-        // 3. Send KEEPALIVE (we've processed their OPEN)
-        self.send_keepalive().await?;
-
-        // 4. Wait for peer's KEEPALIVE
-        let header = self.read_header().await?;
-        self.expect_message(&header, MessageType::Keepalive).await?;
-
-        Ok(peer_open)
     }
 
     /// Read any BGP message

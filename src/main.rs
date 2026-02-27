@@ -5,7 +5,7 @@ mod metrics;
 use backend::nftables::Nftables;
 use backend::{Action, Backend, Rule};
 use bgp::attributes::PathAttribute;
-use bgp::command::{parse_command, Command};
+use bgp::command::{parse_pipe_command, PipeCommand};
 use bgp::flowspec::TrafficAction;
 use bgp::fsm::{Fsm, FsmAction, FsmConfig, FsmEvent, FsmState};
 use bgp::session::extract_flowspec;
@@ -88,7 +88,7 @@ fn create_fifo(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Command reader task - reads from FIFO and sends parsed commands to channel
-async fn command_reader_loop(path: String, tx: mpsc::Sender<Command>) {
+async fn command_reader_loop(path: String, tx: mpsc::Sender<PipeCommand>) {
     loop {
         // Open FIFO for reading (blocks until a writer connects)
         match tokio::fs::File::open(&path).await {
@@ -110,9 +110,9 @@ async fn command_reader_loop(path: String, tx: mpsc::Sender<Command>) {
                                 continue;
                             }
 
-                            match parse_command(trimmed) {
+                            match parse_pipe_command(trimmed) {
                                 Ok(cmd) => {
-                                    eprintln!("Pipe: Received command: {:?}", cmd.operation);
+                                    eprintln!("Pipe: Received command: {:?}", cmd);
                                     if tx.send(cmd).await.is_err() {
                                         eprintln!("Pipe: Receiver dropped, stopping reader");
                                         return;

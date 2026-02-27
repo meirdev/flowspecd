@@ -4,6 +4,7 @@
 //! ```text
 //! announce flowspec source 10.0.0.0/24 destination-port =80 protocol =tcp then discard
 //! withdraw flowspec source 10.0.0.0/24 destination-port =80 protocol =tcp
+//! shutdown
 //! ```
 
 use std::fmt;
@@ -12,6 +13,15 @@ use super::flowspec::{
     BitmaskMatch, BitmaskOp, Component, FlowSpecNlri, NumericMatch, NumericOp, TrafficAction,
 };
 use super::Prefix;
+
+/// Command received from the pipe - can be FlowSpec or control command
+#[derive(Debug, Clone)]
+pub enum PipeCommand {
+    /// FlowSpec announce/withdraw command
+    FlowSpec(Command),
+    /// Graceful shutdown - sends NOTIFICATION and closes session
+    Shutdown,
+}
 
 /// Command operation type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,16 +45,13 @@ pub enum ParseError {
     UnknownCommand(String),
     MissingFlowspecKeyword,
     InvalidPrefix(String),
-    InvalidPort(String),
     InvalidProtocol(String),
-    InvalidOperator(String),
     InvalidTcpFlags(String),
     InvalidFragment(String),
     InvalidAction(String),
     MissingValue(String),
     InvalidNumber(String),
     UnknownField(String),
-    MissingBracket,
 }
 
 impl fmt::Display for ParseError {
@@ -54,21 +61,40 @@ impl fmt::Display for ParseError {
             ParseError::UnknownCommand(s) => write!(f, "unknown command: {}", s),
             ParseError::MissingFlowspecKeyword => write!(f, "missing 'flowspec' keyword"),
             ParseError::InvalidPrefix(s) => write!(f, "invalid prefix: {}", s),
-            ParseError::InvalidPort(s) => write!(f, "invalid port: {}", s),
             ParseError::InvalidProtocol(s) => write!(f, "invalid protocol: {}", s),
-            ParseError::InvalidOperator(s) => write!(f, "invalid operator: {}", s),
             ParseError::InvalidTcpFlags(s) => write!(f, "invalid tcp flags: {}", s),
             ParseError::InvalidFragment(s) => write!(f, "invalid fragment type: {}", s),
             ParseError::InvalidAction(s) => write!(f, "invalid action: {}", s),
             ParseError::MissingValue(s) => write!(f, "missing value for: {}", s),
             ParseError::InvalidNumber(s) => write!(f, "invalid number: {}", s),
             ParseError::UnknownField(s) => write!(f, "unknown field: {}", s),
-            ParseError::MissingBracket => write!(f, "missing bracket"),
         }
     }
 }
 
 impl std::error::Error for ParseError {}
+
+/// Parse a pipe command (FlowSpec or control command)
+pub fn parse_pipe_command(line: &str) -> Result<PipeCommand, ParseError> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return Err(ParseError::EmptyInput);
+    }
+
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Err(ParseError::EmptyInput);
+    }
+
+    // Check for control commands first
+    match tokens[0].to_lowercase().as_str() {
+        "shutdown" | "stop" => return Ok(PipeCommand::Shutdown),
+        _ => {}
+    }
+
+    // Otherwise, parse as FlowSpec command
+    parse_command(line).map(PipeCommand::FlowSpec)
+}
 
 /// Parse a command line into a Command struct
 pub fn parse_command(line: &str) -> Result<Command, ParseError> {
@@ -760,5 +786,27 @@ mod tests {
     fn test_invalid_command() {
         assert!(parse_command("invalid flowspec source 10.0.0.0/24").is_err());
         assert!(parse_command("announce notflowspec source 10.0.0.0/24").is_err());
+    }
+
+    #[test]
+    fn test_parse_shutdown() {
+        let cmd = parse_pipe_command("shutdown").unwrap();
+        assert!(matches!(cmd, PipeCommand::Shutdown));
+
+        let cmd = parse_pipe_command("stop").unwrap();
+        assert!(matches!(cmd, PipeCommand::Shutdown));
+
+        let cmd = parse_pipe_command("SHUTDOWN").unwrap();
+        assert!(matches!(cmd, PipeCommand::Shutdown));
+    }
+
+    #[test]
+    fn test_parse_pipe_flowspec() {
+        let cmd = parse_pipe_command("announce flowspec destination-port =80 then discard").unwrap();
+        assert!(matches!(cmd, PipeCommand::FlowSpec(_)));
+
+        if let PipeCommand::FlowSpec(fs_cmd) = cmd {
+            assert_eq!(fs_cmd.operation, Operation::Announce);
+        }
     }
 }
