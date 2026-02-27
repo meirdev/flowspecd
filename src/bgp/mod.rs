@@ -1,7 +1,9 @@
 pub mod attributes;
+pub mod command;
 pub mod flowspec;
 pub mod fsm;
 pub mod session;
+pub mod update_builder;
 
 use deku::prelude::*;
 use num_derive::ToPrimitive;

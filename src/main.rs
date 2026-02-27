@@ -5,6 +5,7 @@ mod metrics;
 use backend::nftables::Nftables;
 use backend::{Action, Backend, Rule};
 use bgp::attributes::PathAttribute;
+use bgp::command::{parse_command, Command};
 use bgp::flowspec::TrafficAction;
 use bgp::fsm::{Fsm, FsmAction, FsmConfig, FsmEvent, FsmState};
 use bgp::session::extract_flowspec;
@@ -12,6 +13,8 @@ use bgp::session::extract_flowspec_withdrawals;
 use bgp::Update;
 use clap::Parser;
 use deku::DekuContainerRead;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
 #[command(name = "rust-router")]
@@ -44,6 +47,10 @@ struct Args {
     /// Prometheus metrics port (if not set, metrics are disabled)
     #[arg(long)]
     metrics_port: Option<u16>,
+
+    /// Path to command pipe (FIFO) for runtime FlowSpec injection
+    #[arg(long)]
+    pipe: Option<String>,
 }
 
 /// Parse BGP ID from dotted decimal (10.0.0.1) or hex (0x0A000001)
@@ -63,6 +70,71 @@ fn parse_bgp_id(s: &str) -> Result<u32, String> {
             | (octets[3] as u32))
     } else {
         s.parse::<u32>().map_err(|e| e.to_string())
+    }
+}
+
+/// Create a named pipe (FIFO) at the given path
+fn create_fifo(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+
+    // Remove existing file if present
+    let _ = std::fs::remove_file(path);
+
+    // Create FIFO with read/write permissions for owner
+    mkfifo(path, Mode::S_IRUSR | Mode::S_IWUSR)?;
+
+    Ok(())
+}
+
+/// Command reader task - reads from FIFO and sends parsed commands to channel
+async fn command_reader_loop(path: String, tx: mpsc::Sender<Command>) {
+    loop {
+        // Open FIFO for reading (blocks until a writer connects)
+        match tokio::fs::File::open(&path).await {
+            Ok(file) => {
+                let mut reader = BufReader::new(file);
+                let mut line = String::new();
+
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => {
+                            // EOF - writer closed, reopen the FIFO
+                            eprintln!("Pipe: Writer disconnected, waiting for new writer...");
+                            break;
+                        }
+                        Ok(_) => {
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() || trimmed.starts_with('#') {
+                                continue;
+                            }
+
+                            match parse_command(trimmed) {
+                                Ok(cmd) => {
+                                    eprintln!("Pipe: Received command: {:?}", cmd.operation);
+                                    if tx.send(cmd).await.is_err() {
+                                        eprintln!("Pipe: Receiver dropped, stopping reader");
+                                        return;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Pipe: Parse error: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Pipe: Read error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Pipe: Failed to open {}: {}", path, e);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
     }
 }
 
@@ -95,6 +167,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create FSM
     let mut fsm = Fsm::new(config);
+
+    // Set up command pipe if configured
+    if let Some(ref pipe_path) = args.pipe {
+        create_fifo(pipe_path)?;
+        println!("Command pipe created at: {}", pipe_path);
+
+        // Create channel for commands
+        let (cmd_tx, cmd_rx) = mpsc::channel(100);
+
+        // Spawn command reader task
+        let path = pipe_path.clone();
+        tokio::spawn(async move {
+            command_reader_loop(path, cmd_tx).await;
+        });
+
+        // Set command receiver on FSM
+        fsm.set_command_receiver(cmd_rx);
+    }
 
     // Send initial start event
     let start_event = if args.connect.is_some() {
@@ -130,6 +220,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("  Peer BGP ID: {:08X}", peer.bgp_id);
                     if let Some(hold_time) = fsm.negotiated_hold_time() {
                         println!("  Negotiated hold time: {} seconds", hold_time.as_secs());
+                    }
+                    if let Some(ref pipe_path) = args.pipe {
+                        println!("\nReady to receive commands via: {}", pipe_path);
+                        println!("Example: echo 'announce flowspec destination-port =80 then discard' > {}", pipe_path);
                     }
                     println!("\nWaiting for UPDATE messages...\n");
                 }

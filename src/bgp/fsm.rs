@@ -4,8 +4,12 @@ use std::time::Duration;
 
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 
+use super::command::Command;
+use super::flowspec::{FlowSpecNlri, TrafficAction};
 use super::session::{Message, Session, SessionError};
+use super::update_builder::UpdateBuilder;
 use super::{ErrorCode, Notification, Open, Update};
 
 /// BGP FSM states per RFC 4271 Section 8.2.2
@@ -90,6 +94,10 @@ pub enum FsmEvent {
         subcode: u8,
         data: Vec<u8>,
     },
+
+    // === Command Events ===
+    /// Command received from named pipe
+    CommandReceived(Command),
 }
 
 impl std::fmt::Display for FsmEvent {
@@ -111,6 +119,7 @@ impl std::fmt::Display for FsmEvent {
             FsmEvent::KeepAliveMsg => write!(f, "KeepAliveMsg"),
             FsmEvent::UpdateMsg(_) => write!(f, "UpdateMsg"),
             FsmEvent::UpdateMsgErr { .. } => write!(f, "UpdateMsgErr"),
+            FsmEvent::CommandReceived(_) => write!(f, "CommandReceived"),
         }
     }
 }
@@ -142,6 +151,11 @@ pub enum FsmAction {
     PeerNotification(Notification),
     /// Release all resources
     ReleaseResources,
+    /// Send UPDATE message with FlowSpec
+    SendUpdate {
+        announce: Option<(FlowSpecNlri, TrafficAction)>,
+        withdraw: Option<FlowSpecNlri>,
+    },
 }
 
 /// FSM error types
@@ -271,6 +285,9 @@ pub struct Fsm {
 
     /// Keepalive timer state
     keepalive_timer: TimerState,
+
+    /// Command receiver for FlowSpec injection
+    command_rx: Option<mpsc::Receiver<Command>>,
 }
 
 impl Fsm {
@@ -287,7 +304,13 @@ impl Fsm {
             connect_retry_timer: TimerState::new(),
             hold_timer: TimerState::new(),
             keepalive_timer: TimerState::new(),
+            command_rx: None,
         }
+    }
+
+    /// Set the command receiver for FlowSpec injection
+    pub fn set_command_receiver(&mut self, rx: mpsc::Receiver<Command>) {
+        self.command_rx = Some(rx);
     }
 
     /// Get current state
@@ -394,6 +417,31 @@ impl Fsm {
 
     fn transition(&mut self, event: FsmEvent) -> (FsmState, FsmAction) {
         match (&self.state, event) {
+            // === Command Events ===
+            // Handle command in Established state - send UPDATE
+            (FsmState::Established, FsmEvent::CommandReceived(cmd)) => {
+                use super::command::Operation;
+
+                let (announce, withdraw) = match cmd.operation {
+                    Operation::Announce => {
+                        let action = cmd.action.unwrap_or(TrafficAction::RateBytes {
+                            as_number: 0,
+                            rate: 0.0,
+                        });
+                        (Some((cmd.flowspec, action)), None)
+                    }
+                    Operation::Withdraw => (None, Some(cmd.flowspec)),
+                };
+
+                (FsmState::Established, FsmAction::SendUpdate { announce, withdraw })
+            }
+
+            // Ignore command in non-Established states
+            (_, FsmEvent::CommandReceived(_)) => {
+                eprintln!("FSM: Command ignored - session not established");
+                (self.state, FsmAction::None)
+            }
+
             // === Idle State ===
             (FsmState::Idle, FsmEvent::ManualStart) => {
                 self.connect_retry_counter = 0;
@@ -909,6 +957,20 @@ impl Fsm {
                     }
                 }
 
+                // Command from pipe
+                result = async {
+                    if let Some(ref mut rx) = self.command_rx {
+                        rx.recv().await
+                    } else {
+                        std::future::pending::<Option<Command>>().await
+                    }
+                } => {
+                    if let Some(cmd) = result {
+                        return Ok(FsmEvent::CommandReceived(cmd));
+                    }
+                    // Channel closed, just continue
+                }
+
                 // BGP message from session
                 result = async {
                     if let Some(ref mut session) = self.session {
@@ -1055,6 +1117,32 @@ impl Fsm {
 
             FsmAction::ReleaseResources => {
                 self.release_resources();
+                Ok(None)
+            }
+
+            FsmAction::SendUpdate { announce, withdraw } => {
+                eprintln!("FSM: execute_action SendUpdate, state={}", self.state);
+                if let Some(ref mut session) = self.session {
+                    let mut builder = UpdateBuilder::new();
+
+                    if let Some((nlri, action)) = announce {
+                        eprintln!("FSM: Sending FlowSpec announce: {:?}", nlri.components);
+                        eprintln!("FSM: Traffic action: {:?}", action);
+                        builder.announce(nlri, action);
+                    }
+
+                    if let Some(nlri) = withdraw {
+                        eprintln!("FSM: Sending FlowSpec withdraw: {:?}", nlri.components);
+                        builder.withdraw(nlri);
+                    }
+
+                    let update_bytes = builder.build();
+                    eprintln!("FSM: Calling session.send_update with {} bytes", update_bytes.len());
+                    session.send_update(update_bytes).await?;
+                    eprintln!("FSM: send_update completed successfully");
+                } else {
+                    eprintln!("FSM: WARNING - no session available for SendUpdate!");
+                }
                 Ok(None)
             }
         }

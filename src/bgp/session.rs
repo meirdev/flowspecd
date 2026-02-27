@@ -110,6 +110,22 @@ impl Session {
         Ok(())
     }
 
+    /// Send UPDATE message with raw body bytes
+    pub async fn send_update(&mut self, body: Vec<u8>) -> Result<()> {
+        let header = Header::new(MessageType::Update, body.len() as u16);
+        let header_bytes = header.to_bytes()?;
+
+        eprintln!("DEBUG: Sending UPDATE ({} bytes body)", body.len());
+        eprintln!("DEBUG: Header ({} bytes): {:02X?}", header_bytes.len(), header_bytes);
+        eprintln!("DEBUG: Body: {:02X?}", body);
+
+        self.stream.write_all(&header_bytes).await?;
+        self.stream.write_all(&body).await?;
+        self.stream.flush().await?;
+        eprintln!("DEBUG: UPDATE sent successfully");
+        Ok(())
+    }
+
     pub async fn read_header(&mut self) -> Result<Header> {
         let mut buf = [0u8; BGP_HEADER_LEN];
         self.stream.read_exact(&mut buf).await?;
