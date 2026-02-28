@@ -2,13 +2,17 @@
 
 A BGP FlowSpec daemon that receives FlowSpec rules via BGP and translates them into nftables firewall rules.
 
+## Docs
+
+- [Dissemination of Flow Specification Rules](https://datatracker.ietf.org/doc/html/rfc8955)
+- [A Border Gateway Protocol 4 (BGP-4)](https://datatracker.ietf.org/doc/html/rfc4271)
+
 ## Features
 
 - **BGP FSM**: Full RFC 4271 compliant finite state machine
 - **FlowSpec support**: RFC 5575/8955 IPv4 FlowSpec
 - **nftables backend**: Translates FlowSpec rules to nftables
 - **Named pipe control**: Inject FlowSpec commands locally via FIFO
-- **GoBGP compatible**: Tested with GoBGP as upstream router
 
 ## Usage
 
