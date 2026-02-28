@@ -2,7 +2,7 @@
 name = "flowspecd"
 version = "0.1.0"
 edition = "2021"
-description = "Minimal router with BGP FlowSpec and IPFIX support"
+description = "BGP FlowSpec daemon for dynamic firewall rule injection"
 license = "MIT"
 
 [dependencies]
